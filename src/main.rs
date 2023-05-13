@@ -1,5 +1,6 @@
 use byteorder::{ByteOrder, LittleEndian};
 use std::{
+    ffi::CStr,
     fmt::Display,
     io::{self, Write},
 };
@@ -31,24 +32,10 @@ fn db_meta_command(input: &str) -> Result<(), MetaCommandError> {
 
 const COLUMN_USERNAME_SIZE: usize = 32;
 const COLUMN_EMAIL_SIZE: usize = 255;
-#[derive(Debug)]
-struct Row {
-    id: u32,
-    username: [u8; COLUMN_USERNAME_SIZE],
-    email: [u8; COLUMN_EMAIL_SIZE],
-}
-
-impl Display for Row {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let username = std::str::from_utf8(&self.username).unwrap();
-        let email = std::str::from_utf8(&self.email).unwrap();
-        write!(f, "({}, {}, {})", self.id, username, email)
-    }
-}
 
 const ID_SIZE: usize = std::mem::size_of::<u32>();
-const USERNAME_SIZE: usize = std::mem::size_of::<[u8; COLUMN_USERNAME_SIZE]>();
-const EMAIL_SIZE: usize = std::mem::size_of::<[u8; COLUMN_EMAIL_SIZE]>();
+const USERNAME_SIZE: usize = std::mem::size_of::<[u8; COLUMN_USERNAME_SIZE + 1]>();
+const EMAIL_SIZE: usize = std::mem::size_of::<[u8; COLUMN_EMAIL_SIZE + 1]>();
 const ID_OFFSET: usize = 0;
 const USERNAME_OFFSET: usize = ID_OFFSET + ID_SIZE;
 const EMAIL_OFFSET: usize = USERNAME_OFFSET + USERNAME_SIZE;
@@ -59,6 +46,27 @@ const TABLE_MAX_PAGES: usize = 100;
 const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
 const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
+#[derive(Debug)]
+struct Row {
+    id: u32,
+    username: [u8; COLUMN_USERNAME_SIZE + 1],
+    email: [u8; COLUMN_EMAIL_SIZE + 1],
+}
+
+impl Display for Row {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let username = CStr::from_bytes_until_nul(&self.username)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let email = CStr::from_bytes_until_nul(&self.email)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        write!(f, "({}, {}, {})", self.id, username, email)
+    }
+}
+
 impl Row {
     fn serialize(&self, dest: &mut [u8]) {
         LittleEndian::write_u32(&mut dest[ID_OFFSET..USERNAME_OFFSET], self.id);
@@ -68,9 +76,9 @@ impl Row {
 
     fn deserialize(src: &[u8]) -> Self {
         let id = LittleEndian::read_u32(&src[ID_OFFSET..USERNAME_OFFSET]);
-        let mut username = [0; COLUMN_USERNAME_SIZE];
+        let mut username = [0; COLUMN_USERNAME_SIZE + 1];
         username.copy_from_slice(&src[USERNAME_OFFSET..EMAIL_OFFSET]);
-        let mut email = [0; COLUMN_EMAIL_SIZE];
+        let mut email = [0; COLUMN_EMAIL_SIZE + 1];
         email.copy_from_slice(&src[EMAIL_OFFSET..ROW_SIZE]);
         Self {
             id,
@@ -126,6 +134,10 @@ enum Statement {
 
 #[derive(Error, Debug)]
 enum PrepareError {
+    #[error("id must be positive")]
+    NegativeId,
+    #[error("string is too long")]
+    StringTooLong,
     #[error("syntax error")]
     SyntaxError,
     #[error("unrecognized keyword at start of '{0}'")]
@@ -138,27 +150,35 @@ fn prepare_statement(input: &str) -> Result<Statement, PrepareError> {
         if tokens.len() != 4 {
             return Err(PrepareError::SyntaxError);
         }
+
         let id = tokens
             .get(1)
             .ok_or(PrepareError::SyntaxError)?
-            .parse::<u32>()
+            .parse::<i64>()
             .map_err(|_| PrepareError::SyntaxError)?;
-        let mut username = tokens
-            .get(2)
-            .ok_or(PrepareError::SyntaxError)?
-            .as_bytes()
-            .to_vec();
-        username.resize(COLUMN_USERNAME_SIZE, 0);
-        let mut email = tokens
-            .get(3)
-            .ok_or(PrepareError::SyntaxError)?
-            .as_bytes()
-            .to_vec();
-        email.resize(COLUMN_EMAIL_SIZE, 0);
+        if id < 0 {
+            return Err(PrepareError::NegativeId);
+        }
+        let id = id as u32;
+
+        let username = tokens.get(2).ok_or(PrepareError::SyntaxError)?.to_string();
+        if username.len() > COLUMN_USERNAME_SIZE {
+            return Err(PrepareError::StringTooLong);
+        }
+        let mut username_bytes = [0; COLUMN_USERNAME_SIZE + 1];
+        username_bytes[..username.len()].copy_from_slice(username.as_bytes());
+
+        let email = tokens.get(3).ok_or(PrepareError::SyntaxError)?.to_string();
+        if email.len() > COLUMN_EMAIL_SIZE {
+            return Err(PrepareError::StringTooLong);
+        }
+        let mut email_bytes = [0; COLUMN_EMAIL_SIZE + 1];
+        email_bytes[..email.len()].copy_from_slice(email.as_bytes());
+
         let row = Row {
-            id: id,
-            username: username.try_into().unwrap(),
-            email: email.try_into().unwrap(),
+            id,
+            username: username_bytes,
+            email: email_bytes,
         };
         Ok(Statement::Insert(row))
     } else if input.starts_with("select") {
@@ -215,7 +235,7 @@ fn main() {
             match db_meta_command(input) {
                 Ok(_) => continue,
                 Err(e) => {
-                    println!("{}", e);
+                    println!("Error: {}", e);
                 }
             }
         }
@@ -223,7 +243,7 @@ fn main() {
         let statement = match prepare_statement(input) {
             Ok(statement) => statement,
             Err(e) => {
-                println!("{}", e);
+                println!("Error: {}", e);
                 continue;
             }
         };
@@ -233,7 +253,7 @@ fn main() {
                 println!("Executed.");
             }
             Err(e) => {
-                println!("{}", e);
+                println!("Error: {}", e);
             }
         }
     }

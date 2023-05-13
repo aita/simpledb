@@ -1,8 +1,13 @@
 use byteorder::{ByteOrder, LittleEndian};
 use std::{
+    env::args,
     ffi::CStr,
     fmt::Display,
-    io::{self, Write},
+    fs::File,
+    io::{self, Read, Seek, Write},
+    os::unix::{fs::PermissionsExt, prelude::FileExt},
+    path::Path,
+    process::exit,
 };
 use thiserror::Error;
 
@@ -19,13 +24,13 @@ fn read_input(buf: &mut String) -> io::Result<usize> {
 enum MetaCommandError {
     #[error("unrecognized command '{0}'")]
     UnrecognizedCommand(String),
+    #[error("exit")]
+    Exit,
 }
 
 fn db_meta_command(input: &str) -> Result<(), MetaCommandError> {
     match input {
-        ".exit" => {
-            std::process::exit(0);
-        }
+        ".exit" => Err(MetaCommandError::Exit),
         _ => Err(MetaCommandError::UnrecognizedCommand(input.to_string())),
     }
 }
@@ -89,40 +94,131 @@ impl Row {
 }
 
 #[derive(Debug)]
-struct Table {
-    num_rows: u32,
+struct Pager {
+    file: File,
+    file_length: usize,
     pages: [Vec<u8>; TABLE_MAX_PAGES],
 }
 
-impl Table {
-    fn new() -> Self {
-        Self {
-            num_rows: 0,
-            pages: [(); TABLE_MAX_PAGES].map(|_| Vec::with_capacity(0)),
-        }
+impl Pager {
+    fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o600);
+        file.set_permissions(perms)?;
+
+        let file_length = file.metadata()?.len() as usize;
+
+        let pages = [(); TABLE_MAX_PAGES].map(|_| Vec::with_capacity(0));
+
+        Ok(Self {
+            file,
+            file_length,
+            pages,
+        })
     }
 
-    fn row_slot(&self, row_num: usize) -> Option<&[u8]> {
-        let page_num = row_num / ROWS_PER_PAGE;
-        let page = &self.pages[page_num];
-        if page.is_empty() {
-            return None;
+    fn get_page(&mut self, page_num: usize) -> io::Result<&mut [u8]> {
+        if page_num > TABLE_MAX_PAGES {
+            panic!(
+                "Tried to fetch page number out of bounds. {} > {}",
+                page_num, TABLE_MAX_PAGES
+            );
         }
-        let row_offset = row_num % ROWS_PER_PAGE;
-        let byte_offset = row_offset * ROW_SIZE;
-        Some(&page[byte_offset..byte_offset + ROW_SIZE])
-    }
 
-    fn row_slot_mut(&mut self, row_num: usize) -> &mut [u8] {
-        let page_num = row_num / ROWS_PER_PAGE;
         let page = &mut self.pages[page_num];
         if page.is_empty() {
-            page.reserve_exact(PAGE_SIZE);
+            // Cache miss. Allocate memory and load from file.
             page.resize(PAGE_SIZE, 0);
+
+            let mut num_pages = self.file_length / PAGE_SIZE;
+            // println!("num_pages: {}, page_num: {}", num_pages, page_num);
+
+            // We might save a partial page at the end of the file
+            if self.file_length % PAGE_SIZE > 0 {
+                num_pages += 1;
+            }
+
+            if page_num <= num_pages {
+                let offset = page_num * PAGE_SIZE;
+                self.file.read_at(page, offset as u64)?;
+            }
         }
+
+        Ok(&mut self.pages[page_num])
+    }
+
+    fn flush(&mut self, page_num: usize, size: usize) -> io::Result<()> {
+        if self.pages[page_num].is_empty() {
+            panic!("Tried to flush empty page");
+        }
+
+        let offset = self
+            .file
+            .seek(io::SeekFrom::Start((page_num * PAGE_SIZE) as u64))?;
+
+        self.file
+            .write_all_at(&self.pages[page_num][..size], offset)
+    }
+}
+
+fn db_open<P: AsRef<Path>>(path: P) -> io::Result<Table> {
+    let pager = Pager::open(path)?;
+    let num_rows = pager.file_length / ROW_SIZE;
+    let table = Table { num_rows, pager };
+    Ok(table)
+}
+
+fn db_close(table: &mut Table) -> io::Result<()> {
+    let num_full_pages: usize = table.num_rows / ROWS_PER_PAGE;
+
+    for i in 0..num_full_pages {
+        if table.pager.pages[i].is_empty() {
+            continue;
+        }
+        table.pager.flush(i, PAGE_SIZE)?;
+    }
+
+    // There may be a partial page at the end of the file
+    // This should not be needed after we switch to a B-tree
+    let num_additional_rows = table.num_rows % ROWS_PER_PAGE;
+    if num_additional_rows > 0 {
+        let page_num = num_full_pages;
+        if !table.pager.pages[page_num].is_empty() {
+            table
+                .pager
+                .flush(page_num, num_additional_rows * ROW_SIZE)?;
+        }
+    }
+
+    table.pager.file.flush()?;
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct Table {
+    num_rows: usize,
+    pager: Pager,
+}
+
+impl Table {
+    fn row_slot(&mut self, row_num: usize) -> &mut [u8] {
+        let page_num = row_num / ROWS_PER_PAGE;
+        let page = self.pager.get_page(page_num).unwrap();
         let row_offset = row_num % ROWS_PER_PAGE;
         let byte_offset = row_offset * ROW_SIZE;
         &mut page[byte_offset..byte_offset + ROW_SIZE]
+    }
+}
+
+impl Drop for Table {
+    fn drop(&mut self) {
+        db_close(self).unwrap();
     }
 }
 
@@ -202,19 +298,19 @@ fn execute_statement(statement: Statement, table: &mut Table) -> Result<(), Exec
 }
 
 fn execute_insert(row: &Row, table: &mut Table) -> Result<(), ExecutionError> {
-    if table.num_rows >= TABLE_MAX_ROWS as u32 {
+    if table.num_rows >= TABLE_MAX_ROWS {
         return Err(ExecutionError::TableFull);
     }
 
     let row_num = table.num_rows as usize;
-    row.serialize(table.row_slot_mut(row_num));
+    row.serialize(table.row_slot(row_num));
     table.num_rows += 1;
     Ok(())
 }
 
-fn execute_select(table: &Table) -> Result<(), ExecutionError> {
+fn execute_select(table: &mut Table) -> Result<(), ExecutionError> {
     for row_num in 0..table.num_rows {
-        let row_slot = table.row_slot(row_num as usize).unwrap();
+        let row_slot = table.row_slot(row_num as usize);
         let row = Row::deserialize(row_slot);
         println!("{}", row);
     }
@@ -222,7 +318,13 @@ fn execute_select(table: &Table) -> Result<(), ExecutionError> {
 }
 
 fn main() {
-    let mut table = Table::new();
+    // let mut table = Table::new();
+    if args().len() != 2 {
+        println!("Must supply a database filename.");
+        exit(1);
+    }
+    let filename = args().nth(1).unwrap();
+    let mut table = db_open(filename).unwrap();
 
     loop {
         print_prompt();
@@ -234,6 +336,9 @@ fn main() {
         if input.starts_with(".") {
             match db_meta_command(input) {
                 Ok(_) => continue,
+                Err(MetaCommandError::Exit) => {
+                    break;
+                }
                 Err(e) => {
                     println!("Error: {}", e);
                 }

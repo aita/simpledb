@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::{self, Seek, Write},
-    os::unix::{fs::PermissionsExt, prelude::FileExt},
+    os::unix::prelude::FileExt,
     path::Path,
     process::exit,
 };
@@ -130,9 +130,6 @@ impl Pager {
             .write(true)
             .create(true)
             .open(path)?;
-        let mut perms = file.metadata()?.permissions();
-        perms.set_mode(0o600);
-        file.set_permissions(perms)?;
 
         let file_length = file.metadata()?.len() as usize;
         let num_pages = file_length / PAGE_SIZE;

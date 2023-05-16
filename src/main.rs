@@ -4,7 +4,7 @@ use std::{
     ffi::CStr,
     fmt::Display,
     fs::File,
-    io::{self, Read, Seek, Write},
+    io::{self, Seek, Write},
     os::unix::{fs::PermissionsExt, prelude::FileExt},
     path::Path,
     process::exit,
@@ -136,7 +136,6 @@ impl Pager {
             page.resize(PAGE_SIZE, 0);
 
             let mut num_pages = self.file_length / PAGE_SIZE;
-            // println!("num_pages: {}, page_num: {}", num_pages, page_num);
 
             // We might save a partial page at the end of the file
             if self.file_length % PAGE_SIZE > 0 {
@@ -201,18 +200,53 @@ fn db_close(table: &mut Table) -> io::Result<()> {
 }
 
 #[derive(Debug)]
+struct Cursor<'a> {
+    table: &'a mut Table,
+    row_num: usize,
+    end_of_table: bool,
+}
+
+impl<'a> Cursor<'a> {
+    fn value(&mut self) -> io::Result<&mut [u8]> {
+        let row_num = self.row_num;
+        let page_num = row_num / ROWS_PER_PAGE;
+        let page = self.table.pager.get_page(page_num)?;
+        let row_offset = row_num % ROWS_PER_PAGE;
+        let byte_offset = row_offset * ROW_SIZE;
+        Ok(&mut page[byte_offset..byte_offset + ROW_SIZE])
+    }
+
+    fn advance(&mut self) {
+        self.row_num += 1;
+        if self.row_num >= self.table.num_rows {
+            self.end_of_table = true;
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Table {
     num_rows: usize,
     pager: Pager,
 }
 
 impl Table {
-    fn row_slot(&mut self, row_num: usize) -> &mut [u8] {
-        let page_num = row_num / ROWS_PER_PAGE;
-        let page = self.pager.get_page(page_num).unwrap();
-        let row_offset = row_num % ROWS_PER_PAGE;
-        let byte_offset = row_offset * ROW_SIZE;
-        &mut page[byte_offset..byte_offset + ROW_SIZE]
+    fn table_start(&mut self) -> Cursor {
+        let end_of_table = self.num_rows == 0;
+        Cursor {
+            table: self,
+            row_num: 0,
+            end_of_table,
+        }
+    }
+
+    fn table_end(&mut self) -> Cursor {
+        let num_rows = self.num_rows;
+        Cursor {
+            table: self,
+            row_num: num_rows,
+            end_of_table: true,
+        }
     }
 }
 
@@ -288,6 +322,8 @@ fn prepare_statement(input: &str) -> Result<Statement, PrepareError> {
 enum ExecutionError {
     #[error("table full")]
     TableFull,
+    #[error("cursor error")]
+    CursorError(#[from] io::Error),
 }
 
 fn execute_statement(statement: Statement, table: &mut Table) -> Result<(), ExecutionError> {
@@ -302,23 +338,25 @@ fn execute_insert(row: &Row, table: &mut Table) -> Result<(), ExecutionError> {
         return Err(ExecutionError::TableFull);
     }
 
-    let row_num = table.num_rows as usize;
-    row.serialize(table.row_slot(row_num));
+    let mut cursor = table.table_end();
+    row.serialize(cursor.value()?);
     table.num_rows += 1;
+
     Ok(())
 }
 
 fn execute_select(table: &mut Table) -> Result<(), ExecutionError> {
-    for row_num in 0..table.num_rows {
-        let row_slot = table.row_slot(row_num as usize);
-        let row = Row::deserialize(row_slot);
+    let mut cursor = table.table_start();
+
+    while !cursor.end_of_table {
+        let row = Row::deserialize(cursor.value()?);
         println!("{}", row);
+        cursor.advance();
     }
     Ok(())
 }
 
 fn main() {
-    // let mut table = Table::new();
     if args().len() != 2 {
         println!("Must supply a database filename.");
         exit(1);

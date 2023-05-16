@@ -11,30 +11,6 @@ use std::{
 };
 use thiserror::Error;
 
-fn print_prompt() {
-    print!("db > ");
-    io::stdout().flush().unwrap();
-}
-
-fn read_input(buf: &mut String) -> io::Result<usize> {
-    io::stdin().read_line(buf)
-}
-
-#[derive(Error, Debug)]
-enum MetaCommandError {
-    #[error("unrecognized command '{0}'")]
-    UnrecognizedCommand(String),
-    #[error("exit")]
-    Exit,
-}
-
-fn db_meta_command(input: &str) -> Result<(), MetaCommandError> {
-    match input {
-        ".exit" => Err(MetaCommandError::Exit),
-        _ => Err(MetaCommandError::UnrecognizedCommand(input.to_string())),
-    }
-}
-
 const COLUMN_USERNAME_SIZE: usize = 32;
 const COLUMN_EMAIL_SIZE: usize = 255;
 
@@ -48,8 +24,55 @@ const ROW_SIZE: usize = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 const PAGE_SIZE: usize = 4096;
 const TABLE_MAX_PAGES: usize = 100;
-const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
-const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
+
+// Common Node Header Layout
+const NODE_TYPE_SIZE: usize = std::mem::size_of::<u8>();
+const NODE_TYPE_OFFSET: usize = 0;
+const IS_ROOT_SIZE: usize = std::mem::size_of::<u8>();
+const IS_ROOT_OFFSET: usize = NODE_TYPE_OFFSET + NODE_TYPE_SIZE;
+const PARENT_POINTER_SIZE: usize = std::mem::size_of::<u32>();
+const PARENT_POINTER_OFFSET: usize = IS_ROOT_OFFSET + IS_ROOT_SIZE;
+const COMMON_NODE_HEADER_SIZE: usize = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
+
+// Leaf Node Header Layout
+const LEAF_NODE_NUM_CELLS_SIZE: usize = std::mem::size_of::<u32>();
+const LEAF_NODE_NUM_CELLS_OFFSET: usize = COMMON_NODE_HEADER_SIZE;
+const LEAF_NODE_HEADER_SIZE: usize = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+
+// Leaf Node Body Layout
+const LEAF_NODE_KEY_SIZE: usize = std::mem::size_of::<u32>();
+const LEAF_NODE_KEY_OFFSET: usize = 0;
+const LEAF_NODE_VALUE_SIZE: usize = ROW_SIZE;
+const LEAF_NODE_VALUE_OFFSET: usize = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
+const LEAF_NODE_CELL_SIZE: usize = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+const LEAF_NODE_SPACE_FOR_CELLS: usize = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const LEAF_NODE_MAX_CELLS: usize = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
+unsafe fn leaf_node_num_cells(node: &mut [u8]) -> &mut u32 {
+    &mut *(node[LEAF_NODE_NUM_CELLS_OFFSET..LEAF_NODE_HEADER_SIZE].as_mut_ptr() as *mut u32)
+}
+
+fn leaf_node_offset(cell_num: usize) -> usize {
+    LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE
+}
+
+fn leaf_node_cell(node: &mut [u8], cell_num: usize) -> &mut [u8] {
+    &mut node[leaf_node_offset(cell_num)..leaf_node_offset(cell_num + 1)]
+}
+
+unsafe fn leaf_node_key(node: &mut [u8], cell_num: usize) -> &mut u32 {
+    &mut *(leaf_node_cell(node, cell_num).as_mut_ptr() as *mut u32)
+}
+
+fn leaf_node_value(node: &mut [u8], cell_num: usize) -> &mut [u8] {
+    leaf_node_cell(node, cell_num)[LEAF_NODE_KEY_SIZE..]
+        .split_at_mut(LEAF_NODE_VALUE_SIZE)
+        .0
+}
+
+unsafe fn initialize_leaf_node(node: &mut [u8]) {
+    *leaf_node_num_cells(node) = 0;
+}
 
 #[derive(Debug)]
 struct Row {
@@ -97,6 +120,7 @@ impl Row {
 struct Pager {
     file: File,
     file_length: usize,
+    num_pages: usize,
     pages: [Vec<u8>; TABLE_MAX_PAGES],
 }
 
@@ -112,12 +136,21 @@ impl Pager {
         file.set_permissions(perms)?;
 
         let file_length = file.metadata()?.len() as usize;
+        let num_pages = file_length / PAGE_SIZE;
+
+        if file_length % PAGE_SIZE != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Db file is not a whole number of pages",
+            ));
+        }
 
         let pages = [(); TABLE_MAX_PAGES].map(|_| Vec::with_capacity(0));
 
         Ok(Self {
             file,
             file_length,
+            num_pages,
             pages,
         })
     }
@@ -146,12 +179,16 @@ impl Pager {
                 let offset = page_num * PAGE_SIZE;
                 self.file.read_at(page, offset as u64)?;
             }
+
+            if page_num >= self.num_pages {
+                self.num_pages = page_num + 1;
+            }
         }
 
         Ok(&mut self.pages[page_num])
     }
 
-    fn flush(&mut self, page_num: usize, size: usize) -> io::Result<()> {
+    fn flush(&mut self, page_num: usize) -> io::Result<()> {
         if self.pages[page_num].is_empty() {
             panic!("Tried to flush empty page");
         }
@@ -161,37 +198,34 @@ impl Pager {
             .seek(io::SeekFrom::Start((page_num * PAGE_SIZE) as u64))?;
 
         self.file
-            .write_all_at(&self.pages[page_num][..size], offset)
+            .write_all_at(&self.pages[page_num][..PAGE_SIZE], offset)
     }
 }
 
 fn db_open<P: AsRef<Path>>(path: P) -> io::Result<Table> {
-    let pager = Pager::open(path)?;
-    let num_rows = pager.file_length / ROW_SIZE;
-    let table = Table { num_rows, pager };
-    Ok(table)
+    let mut pager = Pager::open(path)?;
+    let root_page_num = 0;
+
+    if pager.num_pages == 0 {
+        // New database file. Initialize page 0 as leaf node.
+        let root_node = pager.get_page(root_page_num)?;
+        unsafe {
+            initialize_leaf_node(root_node);
+        }
+    }
+
+    Ok(Table {
+        root_page_num,
+        pager,
+    })
 }
 
 fn db_close(table: &mut Table) -> io::Result<()> {
-    let num_full_pages: usize = table.num_rows / ROWS_PER_PAGE;
-
-    for i in 0..num_full_pages {
+    for i in 0..table.pager.num_pages {
         if table.pager.pages[i].is_empty() {
             continue;
         }
-        table.pager.flush(i, PAGE_SIZE)?;
-    }
-
-    // There may be a partial page at the end of the file
-    // This should not be needed after we switch to a B-tree
-    let num_additional_rows = table.num_rows % ROWS_PER_PAGE;
-    if num_additional_rows > 0 {
-        let page_num = num_full_pages;
-        if !table.pager.pages[page_num].is_empty() {
-            table
-                .pager
-                .flush(page_num, num_additional_rows * ROW_SIZE)?;
-        }
+        table.pager.flush(i)?;
     }
 
     table.pager.file.flush()?;
@@ -202,57 +236,142 @@ fn db_close(table: &mut Table) -> io::Result<()> {
 #[derive(Debug)]
 struct Cursor<'a> {
     table: &'a mut Table,
-    row_num: usize,
+    page_num: usize,
+    cell_num: usize,
     end_of_table: bool,
 }
 
 impl<'a> Cursor<'a> {
     fn value(&mut self) -> io::Result<&mut [u8]> {
-        let row_num = self.row_num;
-        let page_num = row_num / ROWS_PER_PAGE;
+        let page_num = self.page_num;
         let page = self.table.pager.get_page(page_num)?;
-        let row_offset = row_num % ROWS_PER_PAGE;
-        let byte_offset = row_offset * ROW_SIZE;
-        Ok(&mut page[byte_offset..byte_offset + ROW_SIZE])
+        Ok(leaf_node_value(page, self.cell_num))
     }
 
-    fn advance(&mut self) {
-        self.row_num += 1;
-        if self.row_num >= self.table.num_rows {
+    fn advance(&mut self) -> io::Result<()> {
+        let node = self.table.pager.get_page(self.page_num)?;
+        self.cell_num += 1;
+        if self.cell_num >= *unsafe { leaf_node_num_cells(node) } as usize {
             self.end_of_table = true;
         }
+        Ok(())
+    }
+
+    fn leaf_node_insert(&mut self, key: u32, value: &Row) -> io::Result<()> {
+        let node = self.table.pager.get_page(self.page_num)?;
+
+        let num_cells = *unsafe { leaf_node_num_cells(node) } as usize;
+        if num_cells >= LEAF_NODE_MAX_CELLS {
+            // Node full
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Need to implement splitting a leaf node",
+            ));
+        }
+
+        if self.cell_num <= num_cells {
+            // Make room for new cell
+            for i in (self.cell_num + 1..=num_cells).rev() {
+                let (src, dest) = node[leaf_node_offset(i - 1)..leaf_node_offset(i + 1)]
+                    .split_at_mut(LEAF_NODE_CELL_SIZE);
+                dest.copy_from_slice(src);
+            }
+        }
+
+        *unsafe { leaf_node_num_cells(node) } += 1;
+        *unsafe { leaf_node_key(node, self.cell_num) } = key;
+
+        value.serialize(leaf_node_value(node, self.cell_num));
+
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 struct Table {
-    num_rows: usize,
     pager: Pager,
+    root_page_num: usize,
 }
 
 impl Table {
-    fn table_start(&mut self) -> Cursor {
-        let end_of_table = self.num_rows == 0;
-        Cursor {
+    fn table_start(&mut self) -> io::Result<Cursor> {
+        let page_num = self.root_page_num;
+        let cell_num = 0;
+
+        let root_node = self.pager.get_page(page_num)?;
+        let num_cells = *unsafe { leaf_node_num_cells(root_node) } as usize;
+        let end_of_table = num_cells == 0;
+
+        Ok(Cursor {
             table: self,
-            row_num: 0,
+            page_num,
+            cell_num,
             end_of_table,
-        }
+        })
     }
 
-    fn table_end(&mut self) -> Cursor {
-        let num_rows = self.num_rows;
-        Cursor {
+    fn table_end(&mut self) -> io::Result<Cursor> {
+        let page_num = self.root_page_num;
+
+        let root_node = self.pager.get_page(page_num)?;
+        let cell_num = *unsafe { leaf_node_num_cells(root_node) } as usize;
+        let end_of_table = true;
+
+        Ok(Cursor {
             table: self,
-            row_num: num_rows,
-            end_of_table: true,
-        }
+            page_num,
+            cell_num,
+            end_of_table,
+        })
     }
 }
 
 impl Drop for Table {
     fn drop(&mut self) {
         db_close(self).unwrap();
+    }
+}
+
+#[derive(Error, Debug)]
+enum MetaCommandError {
+    #[error("unrecognized command '{0}'")]
+    UnrecognizedCommand(String),
+    #[error("exit")]
+    Exit,
+}
+
+fn db_meta_command(input: &str, table: &mut Table) -> Result<(), MetaCommandError> {
+    match input {
+        ".exit" => Err(MetaCommandError::Exit),
+        ".constants" => {
+            println!("Constants:");
+            print_constants();
+            Ok(())
+        }
+        ".btree" => {
+            println!("Tree:");
+            print_leaf_node(table.pager.get_page(0).unwrap());
+            Ok(())
+        }
+        _ => Err(MetaCommandError::UnrecognizedCommand(input.to_string())),
+    }
+}
+
+fn print_constants() {
+    println!("ROW_SIZE: {}", ROW_SIZE);
+    println!("COMMON_NODE_HEADER_SIZE: {}", COMMON_NODE_HEADER_SIZE);
+    println!("LEAF_NODE_HEADER_SIZE: {}", LEAF_NODE_HEADER_SIZE);
+    println!("LEAF_NODE_CELL_SIZE: {}", LEAF_NODE_CELL_SIZE);
+    println!("LEAF_NODE_SPACE_FOR_CELLS: {}", LEAF_NODE_SPACE_FOR_CELLS);
+    println!("LEAF_NODE_MAX_CELLS: {}", LEAF_NODE_MAX_CELLS);
+}
+
+fn print_leaf_node(node: &mut [u8]) {
+    let num_cells = *unsafe { leaf_node_num_cells(node) } as usize;
+    println!("leaf (size {})", num_cells);
+    for i in 0..num_cells {
+        let key = *unsafe { leaf_node_key(node, i) };
+        println!("  - {} : {}", i, key);
     }
 }
 
@@ -334,26 +453,35 @@ fn execute_statement(statement: Statement, table: &mut Table) -> Result<(), Exec
 }
 
 fn execute_insert(row: &Row, table: &mut Table) -> Result<(), ExecutionError> {
-    if table.num_rows >= TABLE_MAX_ROWS {
+    let node = table.pager.get_page(table.root_page_num)?;
+    if *unsafe { leaf_node_num_cells(node) } as usize >= LEAF_NODE_MAX_CELLS {
         return Err(ExecutionError::TableFull);
     }
 
-    let mut cursor = table.table_end();
-    row.serialize(cursor.value()?);
-    table.num_rows += 1;
+    let mut cursor = table.table_end()?;
+    cursor.leaf_node_insert(row.id, row)?;
 
     Ok(())
 }
 
 fn execute_select(table: &mut Table) -> Result<(), ExecutionError> {
-    let mut cursor = table.table_start();
+    let mut cursor = table.table_start()?;
 
     while !cursor.end_of_table {
         let row = Row::deserialize(cursor.value()?);
         println!("{}", row);
-        cursor.advance();
+        cursor.advance()?;
     }
     Ok(())
+}
+
+fn print_prompt() {
+    print!("db > ");
+    io::stdout().flush().unwrap();
+}
+
+fn read_input(buf: &mut String) -> io::Result<usize> {
+    io::stdin().read_line(buf)
 }
 
 fn main() {
@@ -372,7 +500,7 @@ fn main() {
         let input = input.trim();
 
         if input.starts_with(".") {
-            match db_meta_command(input) {
+            match db_meta_command(input, &mut table) {
                 Ok(_) => continue,
                 Err(MetaCommandError::Exit) => {
                     break;

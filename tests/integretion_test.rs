@@ -129,3 +129,54 @@ Executed.
 db > "#,
     );
 }
+
+#[test]
+fn print_constants() {
+    let test_db = Temp::new_file().unwrap();
+
+    let mut cmd = Command::cargo_bin("simpledb").unwrap();
+    let assert = cmd
+        .arg(test_db.as_os_str())
+        .write_stdin(
+            r#".constants
+.exit"#,
+        )
+        .assert();
+
+    assert.success().stdout(
+        r#"db > Constants:
+ROW_SIZE: 293
+COMMON_NODE_HEADER_SIZE: 6
+LEAF_NODE_HEADER_SIZE: 10
+LEAF_NODE_CELL_SIZE: 297
+LEAF_NODE_SPACE_FOR_CELLS: 4086
+LEAF_NODE_MAX_CELLS: 13
+db > "#,
+    );
+}
+
+#[test]
+fn print_leaf_node() {
+    let test_db = Temp::new_file().unwrap();
+
+    let mut cmd = Command::cargo_bin("simpledb").unwrap();
+    let mut buf = String::new();
+    for i in [3, 1, 2].iter() {
+        buf.push_str(&format!("insert {} user{} person{}@example.com\n", i, i, i));
+    }
+    buf.push_str(".btree\n");
+    buf.push_str(".exit\n");
+    let assert = cmd.arg(test_db.as_os_str()).write_stdin(buf).assert();
+
+    assert.success().stdout(
+        r#"db > Executed.
+db > Executed.
+db > Executed.
+db > Tree:
+leaf (size 3)
+  - 0 : 3
+  - 1 : 1
+  - 2 : 2
+db > "#,
+    );
+}

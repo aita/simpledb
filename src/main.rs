@@ -1,4 +1,3 @@
-use byteorder::{ByteOrder, LittleEndian};
 use std::{
     env::args,
     ffi::CStr,
@@ -97,13 +96,13 @@ impl Display for Row {
 
 impl Row {
     fn serialize(&self, dest: &mut [u8]) {
-        LittleEndian::write_u32(&mut dest[ID_OFFSET..USERNAME_OFFSET], self.id);
+        dest[..USERNAME_OFFSET].copy_from_slice(self.id.to_le_bytes().as_slice());
         dest[USERNAME_OFFSET..EMAIL_OFFSET].copy_from_slice(&self.username);
         dest[EMAIL_OFFSET..ROW_SIZE].copy_from_slice(&self.email);
     }
 
     fn deserialize(src: &[u8]) -> Self {
-        let id = LittleEndian::read_u32(&src[ID_OFFSET..USERNAME_OFFSET]);
+        let id = unsafe { *(src[ID_OFFSET..USERNAME_OFFSET].as_ptr() as *const u32) };
         let mut username = [0; COLUMN_USERNAME_SIZE + 1];
         username.copy_from_slice(&src[USERNAME_OFFSET..EMAIL_OFFSET]);
         let mut email = [0; COLUMN_EMAIL_SIZE + 1];

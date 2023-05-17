@@ -290,7 +290,7 @@ struct Table {
 }
 
 impl Table {
-    fn table_start(&mut self) -> io::Result<Cursor> {
+    fn start(&mut self) -> io::Result<Cursor> {
         let page_num = self.root_page_num;
         let cell_num = 0;
 
@@ -306,7 +306,7 @@ impl Table {
         })
     }
 
-    fn table_end(&mut self) -> io::Result<Cursor> {
+    fn end(&mut self) -> io::Result<Cursor> {
         let page_num = self.root_page_num;
 
         let root_node = self.pager.get_page(page_num)?;
@@ -454,14 +454,14 @@ fn execute_insert(row: &Row, table: &mut Table) -> Result<(), ExecutionError> {
         return Err(ExecutionError::TableFull);
     }
 
-    let mut cursor = table.table_end()?;
+    let mut cursor = table.end()?;
     cursor.leaf_node_insert(row.id, row)?;
 
     Ok(())
 }
 
 fn execute_select(table: &mut Table) -> Result<(), ExecutionError> {
-    let mut cursor = table.table_start()?;
+    let mut cursor = table.start()?;
 
     while !cursor.end_of_table {
         let row = Row::deserialize(cursor.value()?);
